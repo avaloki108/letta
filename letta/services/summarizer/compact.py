@@ -1,9 +1,13 @@
 """Standalone compaction functions for message summarization."""
 
 from dataclasses import dataclass
+import os
 from typing import List, Optional
 
-from letta.errors import ContextWindowExceededError
+import httpx
+
+from letta.constants import TOOL_RETURN_TRUNCATION_CHARS
+from letta.errors import ContextWindowExceededError, LettaConfigurationError
 from letta.helpers.message_helper import convert_message_creates_to_messages
 from letta.llm_api.llm_client import LLMClient
 from letta.log import get_logger
@@ -18,6 +22,7 @@ from letta.schemas.user import User
 from letta.services.summarizer.self_summarizer import self_summarize_all, self_summarize_sliding_window
 from letta.services.summarizer.summarizer_all import summarize_all
 from letta.services.summarizer.summarizer_config import CompactionSettings, get_default_prompt_for_mode, get_default_summarizer_model
+from letta.services.summarizer.summarizer import format_messages_as_compact_plaintext
 from letta.services.summarizer.summarizer_sliding_window import (
     count_tokens,
     count_tokens_with_tools,
@@ -28,6 +33,10 @@ from letta.system import package_summarize_message_no_counts
 
 logger = get_logger(__name__)
 
+MORPH_COMPACTION_MODEL = "morph/compact"
+MORPH_COMPACT_API_URL = "https://api.morphllm.com/v1/compact"
+MORPH_COMPACT_TIMEOUT_SECONDS = 60.0
+
 
 @dataclass
 class CompactResult:
@@ -37,6 +46,185 @@ class CompactResult:
     compacted_messages: list[Message]
     summary_text: str
     context_token_estimate: Optional[int]
+
+
+def is_morph_compaction_model(model: Optional[str]) -> bool:
+    return (model or "").strip().lower() == MORPH_COMPACTION_MODEL
+
+
+def _extract_text_from_message(message: Message) -> str:
+    if not message.content:
+        return ""
+
+    parts: list[str] = []
+    for part in message.content:
+        if isinstance(part, TextContent):
+            parts.append(part.text)
+        elif isinstance(part, dict) and part.get("type") == "text":
+            parts.append(str(part.get("text") or ""))
+        else:
+            text = getattr(part, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+    return " ".join(part for part in parts if part).strip()
+
+
+def build_morph_query(messages: List[Message], custom_instructions: Optional[str] = None) -> str:
+    last_user_message = next((message for message in reversed(messages) if message.role == MessageRole.user), None)
+    base_query = _extract_text_from_message(last_user_message) if last_user_message else "Continue the current conversation accurately."
+    custom = (custom_instructions or "").strip()
+    return f"{base_query}\n\nFocus:\n{custom}" if custom else base_query
+
+
+def build_morph_transcript(messages: List[Message]) -> str:
+    return format_messages_as_compact_plaintext(
+        messages,
+        include_system=False,
+        tool_return_truncation_chars=TOOL_RETURN_TRUNCATION_CHARS,
+    )
+
+
+async def call_morph_compact(*, transcript: str, query: str) -> str:
+    api_key = (os.getenv("MORPH_API_KEY") or "").strip()
+    if not api_key:
+        raise LettaConfigurationError("Morph compaction requires MORPH_API_KEY to be set.")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "input": transcript,
+        "query": query,
+        "preserve_recent": 0,
+    }
+
+    async with httpx.AsyncClient(timeout=MORPH_COMPACT_TIMEOUT_SECONDS) as client:
+        response = await client.post(MORPH_COMPACT_API_URL, headers=headers, json=payload)
+
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text.strip()
+        raise LettaConfigurationError(
+            f"Morph compaction request failed ({exc.response.status_code}): {detail or exc.response.reason_phrase}"
+        ) from exc
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise LettaConfigurationError("Morph compaction returned a non-JSON response.") from exc
+
+    output = data.get("output")
+    if not isinstance(output, str) or not output.strip():
+        raise LettaConfigurationError("Morph compaction response did not include a valid output string.")
+    return output
+
+
+async def morph_compact_prefix(messages: List[Message], custom_instructions: Optional[str] = None) -> str:
+    transcript = build_morph_transcript(messages)
+    query = build_morph_query(messages, custom_instructions)
+    return await call_morph_compact(transcript=transcript, query=query)
+
+
+async def morph_compact_all_messages(
+    messages: List[Message],
+    custom_instructions: Optional[str] = None,
+) -> tuple[str, List[Message]]:
+    logger.info(
+        f"Morph-compacting all messages (index 1 to {len(messages) - 2}), keeping last message: {messages[-1].role}"
+    )
+    if messages[-1].role == MessageRole.approval:
+        protected_messages = [messages[-1]]
+        if len(messages) >= 2:
+            potential_assistant = messages[-2]
+            approval_request = messages[-1]
+            if potential_assistant.role == MessageRole.assistant and potential_assistant.step_id == approval_request.step_id:
+                protected_messages = [potential_assistant, approval_request]
+                messages_to_compact = messages[1:-2]
+            else:
+                messages_to_compact = messages[1:-1]
+        else:
+            messages_to_compact = messages[1:-1]
+    else:
+        messages_to_compact = messages[1:]
+        protected_messages = []
+
+    compacted = await morph_compact_prefix(messages_to_compact, custom_instructions)
+    return compacted, [messages[0], *protected_messages]
+
+
+async def morph_compact_via_sliding_window(
+    actor: User,
+    agent_llm_config: LLMConfig,
+    summarizer_config: CompactionSettings,
+    in_context_messages: List[Message],
+) -> tuple[str, List[Message]]:
+    system_prompt = in_context_messages[0]
+    total_message_count = len(in_context_messages)
+
+    if in_context_messages[-1].role == MessageRole.approval:
+        maximum_message_index = total_message_count - 2
+    else:
+        maximum_message_index = total_message_count - 1
+
+    eviction_percentage = summarizer_config.sliding_window_percentage
+    assert summarizer_config.sliding_window_percentage <= 1.0, "Sliding window percentage must be less than or equal to 1.0"
+    assistant_message_index = None
+
+    goal_tokens = (1 - summarizer_config.sliding_window_percentage) * agent_llm_config.context_window
+    approx_token_count = agent_llm_config.context_window
+
+    def is_valid_cutoff(message: Message):
+        if message.role == MessageRole.assistant:
+            return True
+        if message.role == MessageRole.approval:
+            return message.tool_calls is not None and len(message.tool_calls) > 0
+        return False
+
+    while approx_token_count >= goal_tokens and eviction_percentage < 1.0:
+        eviction_percentage += 0.10
+        message_cutoff_index = round(eviction_percentage * total_message_count)
+
+        assistant_message_index = next(
+            (
+                i
+                for i in reversed(range(1, message_cutoff_index + 1))
+                if i < len(in_context_messages) and is_valid_cutoff(in_context_messages[i])
+            ),
+            None,
+        )
+        if assistant_message_index is None:
+            logger.warning(
+                f"No assistant/approval message found for evicting up to index {message_cutoff_index}, incrementing eviction percentage"
+            )
+            continue
+
+        logger.info(f"Attempting to Morph-compact messages index 1:{assistant_message_index} messages")
+        post_compaction_buffer = [system_prompt, *in_context_messages[assistant_message_index:]]
+        approx_token_count = await count_tokens(
+            actor=actor,
+            llm_config=agent_llm_config,
+            messages=post_compaction_buffer,
+        )
+        logger.info(
+            f"Morph-compacting messages index 1:{assistant_message_index} messages resulted in {approx_token_count} tokens, goal is {goal_tokens}"
+        )
+
+    if assistant_message_index is None or eviction_percentage >= 1.0:
+        raise ValueError("No assistant message found for sliding window summarization")
+
+    if assistant_message_index >= maximum_message_index:
+        raise ValueError(f"Assistant message index {assistant_message_index} is at the end of the message buffer, skipping summarization")
+
+    messages_to_compact = in_context_messages[1:assistant_message_index]
+    logger.info(
+        f"Morph-compacting {len(messages_to_compact)} messages, from index 1 to {assistant_message_index} (out of {total_message_count})"
+    )
+
+    compacted = await morph_compact_prefix(messages_to_compact, summarizer_config.prompt)
+    updated_in_context_messages = in_context_messages[assistant_message_index:]
+    return compacted, [system_prompt, *updated_in_context_messages]
 
 
 async def build_summarizer_llm_config(
@@ -179,17 +367,35 @@ async def compact_messages(
     """
     summarizer_config = compaction_settings if compaction_settings else CompactionSettings()
 
-    # Build the LLMConfig used for summarization
-    summarizer_llm_config = await build_summarizer_llm_config(
-        agent_llm_config=agent_llm_config,  # used to set default compaction model
-        summarizer_config=summarizer_config,
-        actor=actor,
-    )
+    use_morph_compaction = is_morph_compaction_model(summarizer_config.model)
+    summarizer_llm_config = None
+    if not use_morph_compaction:
+        # Build the LLMConfig used for summarization
+        summarizer_llm_config = await build_summarizer_llm_config(
+            agent_llm_config=agent_llm_config,  # used to set default compaction model
+            summarizer_config=summarizer_config,
+            actor=actor,
+        )
 
     summarization_mode_used = summarizer_config.mode
     if summarizer_config.prompt is None:
         summarizer_config.prompt = get_default_prompt_for_mode(summarizer_config.mode)
-    if summarizer_config.mode == "self_compact_all":
+    if use_morph_compaction:
+        if summarizer_config.mode in {"all", "self_compact_all"}:
+            summary, compacted_messages = await morph_compact_all_messages(
+                messages=messages,
+                custom_instructions=summarizer_config.prompt,
+            )
+        elif summarizer_config.mode in {"sliding_window", "self_compact_sliding_window"}:
+            summary, compacted_messages = await morph_compact_via_sliding_window(
+                actor=actor,
+                agent_llm_config=agent_llm_config,
+                summarizer_config=summarizer_config,
+                in_context_messages=messages,
+            )
+        else:
+            raise ValueError(f"Invalid summarizer mode: {summarizer_config.mode}")
+    elif summarizer_config.mode == "self_compact_all":
         try:
             summary, compacted_messages = await self_summarize_all(
                 actor=actor,
@@ -367,17 +573,23 @@ async def compact_messages(
 
         # If we used the sliding window mode, try to summarize again with the all mode
         if summarization_mode_used == "sliding_window":
-            summary, compacted_messages = await summarize_all(
-                actor=actor,
-                llm_config=summarizer_llm_config,
-                summarizer_config=summarizer_config,
-                in_context_messages=compacted_messages,
-                agent_id=agent_id,
-                agent_tags=agent_tags,
-                run_id=run_id,
-                step_id=step_id,
-                billing_context=billing_context,
-            )
+            if use_morph_compaction:
+                summary, compacted_messages = await morph_compact_all_messages(
+                    messages=compacted_messages,
+                    custom_instructions=summarizer_config.prompt,
+                )
+            else:
+                summary, compacted_messages = await summarize_all(
+                    actor=actor,
+                    llm_config=summarizer_llm_config,
+                    summarizer_config=summarizer_config,
+                    in_context_messages=compacted_messages,
+                    agent_id=agent_id,
+                    agent_tags=agent_tags,
+                    run_id=run_id,
+                    step_id=step_id,
+                    billing_context=billing_context,
+                )
             summarization_mode_used = "all"
 
         context_token_estimate = await count_tokens_with_tools(

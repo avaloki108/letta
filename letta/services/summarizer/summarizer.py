@@ -353,6 +353,26 @@ def simple_formatter(
     Optionally clamps tool-return content to avoid ballooning the summarizer transcript.
     """
 
+    transcript_body = format_messages_as_compact_plaintext(
+        messages,
+        include_system=include_system,
+        tool_return_truncation_chars=tool_return_truncation_chars,
+    )
+
+    return (
+        "<start_transcript>\n"
+        + transcript_body
+        + "\n<end_transcript>\n. Generate the summary."
+    )
+
+
+def format_messages_as_compact_plaintext(
+    messages: List[Message],
+    include_system: bool = False,
+    tool_return_truncation_chars: int | None = None,
+) -> str:
+    """Format messages as compact plaintext for downstream compaction/summarization."""
+
     parsed_messages = Message.to_openai_dicts_from_list(
         [message for message in messages if message.role != MessageRole.system or include_system],
         tool_return_truncation_chars=tool_return_truncation_chars,
@@ -381,7 +401,7 @@ def simple_formatter(
         except Exception:
             lines.append(json.dumps(msg))
 
-    return "<start_transcript>\n" + "\n".join(lines) + "\n<end_transcript>\n. Generate the summary."
+    return "\n".join(lines)
 
 
 def middle_truncate_text(
