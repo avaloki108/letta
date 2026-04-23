@@ -17,6 +17,6 @@ if [[ "$FORCE_DIRTY" != "1" ]] && [[ -n "$(git status --short)" ]]; then
 fi
 echo "Fetching upstream/$UPSTREAM_BRANCH"
 git fetch upstream "$UPSTREAM_BRANCH"
-echo "Rebasing $LOCAL_BRANCH onto upstream/$UPSTREAM_BRANCH"
-git rebase "upstream/$UPSTREAM_BRANCH"
+echo "Merging upstream/$UPSTREAM_BRANCH into $LOCAL_BRANCH"
+git merge "upstream/$UPSTREAM_BRANCH"
 echo "Upstream update complete."

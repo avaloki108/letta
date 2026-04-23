@@ -12,6 +12,13 @@ This repo uses a main-only custom workflow:
 ./scripts/update-from-upstream.sh
 ```
 
+This runs the same flow as:
+
+```bash
+git fetch upstream
+git merge upstream/main
+```
+
 ### Sync local main to your fork
 ```bash
 ./scripts/sync-fork.sh
@@ -37,9 +44,9 @@ FORCE_DIRTY=1 ./scripts/sync-fork.sh
 git status
 # fix files
 git add <files>
-git rebase --continue
+git commit
 ```
-Abort a rebase with:
+Abort a merge with:
 ```bash
-git rebase --abort
+git merge --abort
 ```
